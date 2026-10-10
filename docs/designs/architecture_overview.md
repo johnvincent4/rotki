@@ -42,6 +42,18 @@ Electron (main + preload)  ─┐
   instancie `Rotkehlchen` puis `APIServer`.
 - Les ports REST et WebSocket sont configurables (`--rest-api-port`, `--websockets-api-port`,
   voir `rotkehlchen/args.py`).
+- **Point d'entrée externe unique (Docker et déploiements authentifiés)** : `starling-proxy`
+  (`crates/starling-proxy/src/lib.rs`) remplace nginx. Il sert le SPA statique et route :
+
+  | Route | Cible | Traitement |
+  |-------|-------|-----------|
+  | `/api/1/*`, `/ws/*` | rotki-core (127.0.0.1:4242) | préfixe conservé, upgrade WebSocket |
+  | `/colibri/*` | colibri (127.0.0.1:4343) | préfixe retiré |
+  | `/mcp` | serveur MCP (127.0.0.1:4445) | préfixe conservé |
+  | `/health` | proxy lui-même | liveness du superviseur |
+
+- Le superviseur gère aussi un service **MCP** (`MCP_SERVICE = "mcp"` dans
+  `crates/starling-core/src/config.rs`), en plus de core et colibri.
 
 ## 3. Backend Python (`rotkehlchen/`)
 
@@ -189,16 +201,36 @@ Organisation de `frontend/app/src/` :
 
 ## 5. Service Colibri (`colibri/`, Rust)
 
-Service local complémentaire, démarré par starling :
+Service local complémentaire, démarré par starling et exposé sous `/colibri/*` :
 
 | Module | Rôle |
 |--------|------|
-| `src/api/` | Endpoints axum : `assets`, `configuration`, `database`, `globaldb_endpoints/`, `health`, `icons`, `prices`, schémas JSON |
+| `src/main.rs` | Routeur axum : `/health`, `/settings/configuration`, `/assets/icon`, `/assets/collections`, `/assets/mappings`, `/assets/search/levenshtein`, `/assets/ignored`, `/prices/oracle`, `/prices/oracle/existence`, `/user` (déverrouillage), `/user/logout` |
+| `src/api/` | Handlers : `assets`, `configuration`, `database`, `globaldb_endpoints/`, `health`, `icons`, `prices`, schémas JSON |
 | `src/blockchain/` | Inquisiteurs de nœuds EVM (`node_inquirer.rs`), ABIs embarquées |
 | `src/database/` | Accès SQLite de la base utilisateur (`user_db.rs`, `sql_utils.rs`) |
 | `src/globaldb/` | Accès à la base globale |
 | `src/coingecko.rs`, `icons.rs` | Prix et cache d'icônes |
 | `src/session.rs`, `http.rs`, `logging.rs`, `args.rs` | Sessions, client HTTP, logs, CLI |
+
+Colibri n'est donc pas seulement un cache : il **ouvre lui-même la base utilisateur** et
+**valide les sessions**. Il partage deux responsabilités avec core : les icônes (migration en cours,
+voir `rotkehlchen/icons.py`) et la lecture des sessions.
+
+## 5 bis. Authentification et sessions
+
+Le mode authentifié (Docker) repose sur un cookie `rotki_session` (`rotkehlchen/api/session_token.py`) :
+
+- core est l'autorité : il signe un jeton HMAC-SHA256 à l'authentification, avec la clé
+  `ROTKI_SESSION_KEY` injectée par l'opérateur. Format : `b64url(payload).b64url(HMAC)`, payload
+  `{u, iat, exp, sid}`.
+- core **et** colibri valident ce cookie sur chaque requête protégée (défense en profondeur).
+- `sid` identifie la session active. Une nouvelle connexion révoque les cookies précédents ; colibri
+  lit en lecture seule `session.db` (`rotkehlchen/api/session_store.py`) pour rejeter immédiatement
+  une session révoquée.
+- Les jetons MCP ont un domaine de signature distinct (`aud: mcp`), afin qu'un jeton MCP ne puisse
+  pas valider un cookie navigateur.
+- Sans `ROTKI_SESSION_KEY`, la fonctionnalité est désactivée (cas d'Electron et du mode standalone).
 
 Colibri est un workspace Cargo avec `crates/starling`, `crates/starling-core` et
 `crates/starling-proxy`. Les versions de dépendances sont épinglées exactement
@@ -242,10 +274,39 @@ Exemple : affichage des soldes.
 | Client API frontend | `frontend/app/src/modules/core/api/rotki-api.ts` |
 | Conventions de code | `AGENTS.md` |
 
-## 9. Limites de ce document
+## 9. Dépendances entre couches (constat)
 
-- Document rédigé par lecture statique de la structure et de quelques fichiers clés ; il ne
-  remplace pas la lecture du code pour les détails d'implémentation.
+L'architecture attendue est : `api/` → services → domaine (`chain/`, `db/`, `accounting/`, …).
+Dans le code, des couches basses importent `api/` :
+
+| Module importé | Importé par | Nature |
+|----------------|------------|--------|
+| `api/websockets/typedefs.py` (`WSMessageType`, `ProgressUpdateSubType`, `HistoryEventsStep`) | `chain/` (9 modules), `db/history_events.py`, `db/updates.py`, `data_handler.py`, `assets/utils.py`, `banks/manager.py` | types de progression, transverses |
+| `api/v1/types.py` (`IncludeExcludeFilterData`) | `db/filtering.py`, `db/history_events.py`, `db/eth2.py`, `chain/ethereum/…` | types de filtre |
+| `api/v1/schemas.py` (`ModifiableSettingsSchema`) | `accounting/debugimporter/json.py` | schéma HTTP utilisé par le moteur comptable |
+
+Au total, 52 modules hors `api/` importent `rotkehlchen.api`. Recommandation : déplacer ces types
+dans un module neutre (voir `subsystems_evaluation.md`, section 3.2).
+
+## 10. Dette documentaire repérée
+
+- `concurrency/__init__.py`, `concurrency/cancellation.py` et `api/asgi.py` décrivent encore un
+  monkeypatching actif, alors que la phase 6 de `docs/designs/gevent_to_asyncio.md` est terminée.
+- Le code ne contient plus aucun `import gevent` ; la règle ruff `TID251` l'interdit.
+
+## 11. Évaluation et tests
+
+L'évaluation de chaque sous-système (taille, tests, dette, priorités) est dans
+`docs/designs/subsystems_evaluation.md`. Résultats d'exécution dans cette session :
+
+- Frontend `vitest` : 1 243 fichiers et 13 197 tests réussis ; un fichier en échec pour cause
+  d'installation Electron bloquée (environnemental).
+- Backend Python et Rust : non exécutés (Python 3.14 et `cargo` indisponibles dans l'environnement).
+
+## 12. Limites de ce document
+
+- Document rédigé par lecture statique de la structure et de fichiers clés, complété par des
+  mesures ; il ne remplace pas la lecture du code pour les détails d'implémentation.
 - Les compteurs (lignes, nombre de tables) sont des ordres de grandeur au commit `a0fc8a5`.
 - L'outil « REA (Reverse Engineer Anything) » n'était pas disponible dans cette session ;
   l'analyse a été faite directement sur le dépôt.
