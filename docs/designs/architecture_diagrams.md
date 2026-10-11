@@ -17,7 +17,7 @@ couche** se trouve un élément. Chaque forme indique **son rôle**.
 ```mermaid
 flowchart LR
     subgraph LEG ["Légende"]
-        direction TB
+        direction LR
         L1["Interface utilisateur<br/>(frontend, TypeScript / Vue)"]:::front
         L2["Logique métier<br/>(backend, Python)"]:::back
         L3["Service de performance ou de supervision<br/>(Rust)"]:::rust
@@ -187,7 +187,7 @@ et empêche d'ouvrir deux fois les mêmes données.
 
 ## Plan 4 : ensembles et sous-ensembles du moteur Python
 
-Chaque grand bloc du moteur. Les flèches montrent qui utilise qui. Les **flèches pointillées rouges**
+Chaque grand bloc du moteur. Les flèches montrent qui utilise qui. Les **flèches pointillées marquées ⚠**
 sont des dépendances à l'envers : une couche basse (calcul, base de données) dépend de l'interface
 HTTP, ce qui n'est pas souhaité.
 
@@ -241,7 +241,7 @@ flowchart TB
 ```
 
 **Lecture** : on devrait pouvoir descendre seulement de haut en bas (de l'entrée vers le stockage).
-Les trois flèches pointillées remontent vers l'entrée : c'est le principal point d'attention
+Les trois flèches pointillées marquées ⚠ remontent vers l'entrée : c'est le principal point d'attention
 technique identifié.
 
 ---
